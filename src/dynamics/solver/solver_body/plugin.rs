@@ -5,8 +5,8 @@ use bevy::{
 
 use super::{SolverBody, SolverBodyInertia};
 use crate::{
-    AngularVelocity, LinearVelocity, PhysicsSchedule, Position, RigidBody, RigidBodyActiveFilter,
-    RigidBodyDisabled, Rotation, Sleeping, SolverSystems, Vector,
+    AngularVelocity, LinearVelocity, PhysicsLengthUnit, PhysicsSchedule, Position, RigidBody,
+    RigidBodyActiveFilter, RigidBodyDisabled, Rotation, Scalar, Sleeping, SolverSystems, Vector,
     dynamics::solver::{SolverDiagnostics, solver_body::SolverBodyFlags},
     prelude::{
         AppDiagnosticsExt, ComputedAngularInertia, ComputedCenterOfMass, ComputedMass, Dominance,
@@ -260,6 +260,24 @@ fn prepare_solver_bodies(
 
 /// Writes back solver body data to rigid bodies.
 #[allow(clippy::type_complexity)]
+/// Largest pose or velocity difference the writeback leaves unwritten.
+///
+/// A body the solver has settled keeps producing deltas a few nanometres wide,
+/// so an exact comparison writes on every step and a body at rest never stops
+/// marking its components changed. These bound how stale a skipped write can
+/// leave a value, and each is about a thousand times the residual a settled
+/// body produces. They are compared against the stored value rather than the
+/// previous candidate, so a value drifting below the threshold accumulates
+/// until it crosses one, which bounds the error at the threshold instead of
+/// letting it run.
+///
+/// The distance ones are scaled by [`PhysicsLengthUnit`], matching the
+/// tolerance `transform_to_position` already applies for the same reason.
+const POSITION_WRITEBACK_TOLERANCE: Scalar = 1.0e-5;
+const ROTATION_WRITEBACK_TOLERANCE: Scalar = 1.0e-5;
+const LINEAR_VELOCITY_WRITEBACK_TOLERANCE: Scalar = 1.0e-6;
+const ANGULAR_VELOCITY_WRITEBACK_TOLERANCE: Scalar = 1.0e-6;
+
 fn writeback_solver_bodies(
     mut query: Query<(
         &SolverBody,
@@ -269,22 +287,54 @@ fn writeback_solver_bodies(
         &mut LinearVelocity,
         &mut AngularVelocity,
     )>,
+    length_unit: Res<PhysicsLengthUnit>,
     mut diagnostics: ResMut<SolverDiagnostics>,
 ) {
     let start = bevy::platform::time::Instant::now();
+    let position_tolerance = length_unit.0 * POSITION_WRITEBACK_TOLERANCE;
+    let linear_velocity_tolerance = length_unit.0 * LINEAR_VELOCITY_WRITEBACK_TOLERANCE;
 
     query.par_iter_mut().for_each(
         |(solver_body, mut pos, mut rot, com, mut lin_vel, mut ang_vel)| {
             // Write back the position and rotation deltas,
             // rotating the body around its center of mass.
+            //
+            // Each write is skipped when it would move the value by less than
+            // its tolerance, so a body the solver has settled stops marking
+            // these components changed on every step. A mutable deref marks a
+            // component changed whether or not the value moved, and a consumer
+            // that gates work on the change tick, such as a replication crate,
+            // otherwise repeats that work for a body at rest forever. Island
+            // sleeping is the usual escape and is not always available.
+            //
+            // `position_to_transform` used to select the bodies it propagates on
+            // this same tick, which made it a dirty flag rather than an
+            // optimization signal. Its filter no longer reads it, for the reason
+            // recorded there.
             let old_world_com = *rot * com.0;
-            *rot = (solver_body.delta_rotation * *rot).fast_renormalize();
-            let new_world_com = *rot * com.0;
-            pos.0 += solver_body.delta_position + old_world_com - new_world_com;
+            let new_rot = (solver_body.delta_rotation * *rot).fast_renormalize();
+            let new_world_com = new_rot * com.0;
+            let new_pos = pos.0 + solver_body.delta_position + old_world_com - new_world_com;
+            // The position correction above assumes the rotation below. Skipping
+            // one and not the other leaves them inconsistent by at most the
+            // rotation tolerance for one step, which the next step resolves,
+            // because both compare against the stored value.
+            if rot.angle_between(new_rot).abs() > ROTATION_WRITEBACK_TOLERANCE {
+                *rot = new_rot;
+            }
+            if pos.0.distance(new_pos) > position_tolerance {
+                pos.0 = new_pos;
+            }
 
             // Write back velocities.
-            lin_vel.0 = solver_body.linear_velocity;
-            ang_vel.0 = solver_body.angular_velocity;
+            if lin_vel.0.distance(solver_body.linear_velocity) > linear_velocity_tolerance {
+                lin_vel.0 = solver_body.linear_velocity;
+            }
+            if ang_vel.0.distance(solver_body.angular_velocity)
+                > ANGULAR_VELOCITY_WRITEBACK_TOLERANCE
+            {
+                ang_vel.0 = solver_body.angular_velocity;
+            }
         },
     );
 

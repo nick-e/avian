@@ -251,10 +251,16 @@ type PosToTransformComponents = (
     Option<&'static ChildOf>,
 );
 
-type PosToTransformFilter = (
-    Or<(With<RigidBody>, With<ApplyPosToTransform>)>,
-    Or<(Changed<Position>, Changed<Rotation>)>,
-);
+// Deliberately not narrowed by `Or<(Changed<Position>, Changed<Rotation>)>`.
+// That filter made the pose's change tick a dirty flag driving propagation, so
+// nothing writing `Position` could use `set_if_neq` without silently stranding
+// a body's `Transform`. The solver writeback does guard its writes, because a
+// consumer replicating on the change tick resends an unmoved body forever and
+// island sleeping, the usual escape, is not always available. The cost of
+// dropping the filter is propagating every body every run rather than only the
+// moved ones, and `Transform` is local state, so the extra writes cost CPU
+// rather than bandwidth.
+type PosToTransformFilter = Or<(With<RigidBody>, With<ApplyPosToTransform>)>;
 
 type ParentComponents = (
     &'static GlobalTransform,
