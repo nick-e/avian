@@ -504,6 +504,11 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                 .collider_query
                 .get_many([contacts.collider1, contacts.collider2])
             else {
+                // A collider was removed or disabled, but the contact pair is still here,
+                // for example because the contact graph was restored from a snapshot.
+                // The pair is stale, so remove it like a pair whose AABBs stopped overlapping.
+                contacts.flags.set(ContactPairFlags::DISJOINT_AABB, true);
+                status_change_bits.set(contact_id);
                 return;
             };
 
@@ -830,5 +835,90 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                     self.contact_status_bits.or(&contact_status_bits);
                 });
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "default-collider")]
+mod tests {
+    use super::*;
+    use bevy::time::TimeUpdateStrategy;
+    use core::time::Duration;
+
+    fn create_app() -> App {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            TransformPlugin,
+            // Restoring the contact graph without the islands would leave the islands inconsistent.
+            PhysicsPlugins::default()
+                .build()
+                .disable::<IslandPlugin>()
+                .disable::<IslandSleepingPlugin>(),
+            bevy::asset::AssetPlugin::default(),
+            #[cfg(feature = "collider-from-mesh")]
+            bevy::mesh::MeshPlugin,
+        ))
+        .insert_resource(Gravity::ZERO)
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+            1.0 / 60.0,
+        )));
+        app
+    }
+
+    /// Restoring the contact graph from a snapshot, as rollback networking does,
+    /// can bring back contact pairs whose colliders were removed or despawned since.
+    /// The narrow phase should remove them instead of solving their stale contacts.
+    #[test]
+    fn restored_contact_pairs_of_removed_colliders_are_removed() {
+        let mut app = create_app();
+        app.finish();
+
+        let center = app
+            .world_mut()
+            .spawn((RigidBody::Static, Collider::capsule(0.5, 1.0)))
+            .id();
+        let removed = app
+            .world_mut()
+            .spawn((
+                RigidBody::Dynamic,
+                Collider::capsule(0.5, 1.0),
+                Transform::from_xyz(0.9, 0.0, 0.0),
+            ))
+            .id();
+        let despawned = app
+            .world_mut()
+            .spawn((
+                RigidBody::Dynamic,
+                Collider::capsule(0.5, 1.0),
+                Transform::from_xyz(-0.9, 0.0, 0.0),
+            ))
+            .id();
+
+        fn is_touching(app: &App, entity1: Entity, entity2: Entity) -> bool {
+            let contact_graph = app.world().resource::<ContactGraph>();
+            contact_graph
+                .get(entity1, entity2)
+                .is_some_and(|(_, pair)| pair.is_touching())
+        }
+
+        for _ in 0..3 {
+            app.update();
+        }
+        assert!(is_touching(&app, center, removed));
+        assert!(is_touching(&app, center, despawned));
+
+        let contact_graph = app.world().resource::<ContactGraph>().clone();
+        let constraint_graph = app.world().resource::<ConstraintGraph>().clone();
+
+        app.world_mut().entity_mut(removed).remove::<Collider>();
+        app.world_mut().despawn(despawned);
+        app.insert_resource(contact_graph);
+        app.insert_resource(constraint_graph);
+        app.update();
+
+        let contact_graph = app.world().resource::<ContactGraph>();
+        assert!(!contact_graph.contains(center, removed));
+        assert!(!contact_graph.contains(center, despawned));
     }
 }
